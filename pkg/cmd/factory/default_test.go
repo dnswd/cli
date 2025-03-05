@@ -9,6 +9,8 @@ import (
 
 	"github.com/cli/cli/v2/git"
 	"github.com/cli/cli/v2/internal/config"
+	"github.com/cli/cli/v2/internal/gh"
+	ghmock "github.com/cli/cli/v2/internal/gh/mock"
 	"github.com/cli/cli/v2/pkg/cmdutil"
 	"github.com/cli/cli/v2/pkg/httpmock"
 	"github.com/cli/cli/v2/pkg/iostreams"
@@ -69,23 +71,21 @@ func Test_BaseRepo(t *testing.T) {
 				readRemotes: func() (git.RemoteSet, error) {
 					return tt.remotes, nil
 				},
-				getConfig: func() (config.Config, error) {
-					cfg := &config.ConfigMock{}
-					cfg.HostsFunc = func() []string {
+				getConfig: func() (gh.Config, error) {
+					cfg := &ghmock.ConfigMock{}
+					cfg.AuthenticationFunc = func() gh.AuthConfig {
+						authCfg := &config.AuthConfig{}
 						hosts := []string{"nonsense.com"}
 						if tt.override != "" {
 							hosts = append([]string{tt.override}, hosts...)
 						}
-						return hosts
-					}
-					cfg.DefaultHostFunc = func() (string, string) {
+						authCfg.SetHosts(hosts)
+						authCfg.SetActiveToken("", "")
+						authCfg.SetDefaultHost("nonsense.com", "hosts")
 						if tt.override != "" {
-							return tt.override, "GH_HOST"
+							authCfg.SetDefaultHost(tt.override, "GH_HOST")
 						}
-						return "nonsense.com", "hosts"
-					}
-					cfg.AuthTokenFunc = func(string) (string, string) {
-						return "", ""
+						return authCfg
 					}
 					return cfg, nil
 				},
@@ -209,23 +209,21 @@ func Test_SmartBaseRepo(t *testing.T) {
 				readRemotes: func() (git.RemoteSet, error) {
 					return tt.remotes, nil
 				},
-				getConfig: func() (config.Config, error) {
-					cfg := &config.ConfigMock{}
-					cfg.AuthTokenFunc = func(_ string) (string, string) {
-						return "", ""
-					}
-					cfg.HostsFunc = func() []string {
+				getConfig: func() (gh.Config, error) {
+					cfg := &ghmock.ConfigMock{}
+					cfg.AuthenticationFunc = func() gh.AuthConfig {
+						authCfg := &config.AuthConfig{}
 						hosts := []string{"nonsense.com"}
 						if tt.override != "" {
 							hosts = append([]string{tt.override}, hosts...)
 						}
-						return hosts
-					}
-					cfg.DefaultHostFunc = func() (string, string) {
+						authCfg.SetHosts(hosts)
+						authCfg.SetActiveToken("", "")
+						authCfg.SetDefaultHost("nonsense.com", "hosts")
 						if tt.override != "" {
-							return tt.override, "GH_HOST"
+							authCfg.SetDefaultHost(tt.override, "GH_HOST")
 						}
-						return "nonsense.com", "hosts"
+						return authCfg
 					}
 					return cfg, nil
 				},
@@ -260,7 +258,7 @@ func Test_OverrideBaseRepo(t *testing.T) {
 	tests := []struct {
 		name        string
 		remotes     git.RemoteSet
-		config      config.Config
+		config      gh.Config
 		envOverride string
 		argOverride string
 		wantsErr    bool
@@ -304,7 +302,7 @@ func Test_OverrideBaseRepo(t *testing.T) {
 				readRemotes: func() (git.RemoteSet, error) {
 					return tt.remotes, nil
 				},
-				getConfig: func() (config.Config, error) {
+				getConfig: func() (gh.Config, error) {
 					return tt.config, nil
 				},
 			}
@@ -327,7 +325,7 @@ func Test_ioStreams_pager(t *testing.T) {
 	tests := []struct {
 		name      string
 		env       map[string]string
-		config    config.Config
+		config    gh.Config
 		wantPager string
 	}{
 		{
@@ -378,7 +376,7 @@ func Test_ioStreams_pager(t *testing.T) {
 				}
 			}
 			f := New("1")
-			f.Config = func() (config.Config, error) {
+			f.Config = func() (gh.Config, error) {
 				if tt.config == nil {
 					return config.NewBlankConfig(), nil
 				} else {
@@ -394,7 +392,7 @@ func Test_ioStreams_pager(t *testing.T) {
 func Test_ioStreams_prompt(t *testing.T) {
 	tests := []struct {
 		name           string
-		config         config.Config
+		config         gh.Config
 		promptDisabled bool
 		env            map[string]string
 	}{
@@ -421,7 +419,7 @@ func Test_ioStreams_prompt(t *testing.T) {
 				}
 			}
 			f := New("1")
-			f.Config = func() (config.Config, error) {
+			f.Config = func() (gh.Config, error) {
 				if tt.config == nil {
 					return config.NewBlankConfig(), nil
 				} else {
@@ -462,7 +460,7 @@ func TestSSOURL(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			f := New("1")
-			f.Config = func() (config.Config, error) {
+			f.Config = func() (gh.Config, error) {
 				return config.NewBlankConfig(), nil
 			}
 			ios, _, _, stderr := iostreams.Test()
@@ -491,7 +489,7 @@ func TestSSOURL(t *testing.T) {
 func TestNewGitClient(t *testing.T) {
 	tests := []struct {
 		name          string
-		config        config.Config
+		config        gh.Config
 		executable    string
 		wantAuthHosts []string
 		wantGhPath    string
@@ -507,7 +505,7 @@ func TestNewGitClient(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			f := New("1")
-			f.Config = func() (config.Config, error) {
+			f.Config = func() (gh.Config, error) {
 				if tt.config == nil {
 					return config.NewBlankConfig(), nil
 				} else {
@@ -526,16 +524,16 @@ func TestNewGitClient(t *testing.T) {
 	}
 }
 
-func defaultConfig() *config.ConfigMock {
+func defaultConfig() *ghmock.ConfigMock {
 	cfg := config.NewFromString("")
 	cfg.Set("nonsense.com", "oauth_token", "BLAH")
 	return cfg
 }
 
-func pagerConfig() config.Config {
+func pagerConfig() gh.Config {
 	return config.NewFromString("pager: CONFIG_PAGER")
 }
 
-func disablePromptConfig() config.Config {
+func disablePromptConfig() gh.Config {
 	return config.NewFromString("prompt: disabled")
 }

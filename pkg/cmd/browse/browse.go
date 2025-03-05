@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"os"
 	"path"
 	"path/filepath"
 	"regexp"
@@ -22,6 +23,10 @@ import (
 	"github.com/spf13/cobra"
 )
 
+const (
+	emptyCommitFlag = "last"
+)
+
 type BrowseOptions struct {
 	BaseRepo         func() (ghrepo.Interface, error)
 	Browser          browser.Browser
@@ -32,13 +37,14 @@ type BrowseOptions struct {
 
 	SelectorArg string
 
-	Branch        string
-	CommitFlag    bool
-	ProjectsFlag  bool
-	ReleasesFlag  bool
-	SettingsFlag  bool
-	WikiFlag      bool
-	NoBrowserFlag bool
+	Branch          string
+	Commit          string
+	ProjectsFlag    bool
+	ReleasesFlag    bool
+	SettingsFlag    bool
+	WikiFlag        bool
+	NoBrowserFlag   bool
+	HasRepoOverride bool
 }
 
 func NewCmdBrowse(f *cmdutil.Factory, runF func(*BrowseOptions) error) *cobra.Command {
@@ -53,34 +59,49 @@ func NewCmdBrowse(f *cmdutil.Factory, runF func(*BrowseOptions) error) *cobra.Co
 	}
 
 	cmd := &cobra.Command{
-		Long:  "Open the GitHub repository in the web browser.",
-		Short: "Open the repository in the browser",
-		Use:   "browse [<number> | <path>]",
-		Args:  cobra.MaximumNArgs(1),
+		Short: "Open repositories, issues, pull requests, and more in the browser",
+		Long: heredoc.Doc(`
+			Transition from the terminal to the web browser to view and interact with:
+
+			- Issues
+			- Pull requests
+			- Repository content
+			- Repository home page
+			- Repository settings
+		`),
+		Use:  "browse [<number> | <path> | <commit-sha>]",
+		Args: cobra.MaximumNArgs(1),
 		Example: heredoc.Doc(`
+			# Open the home page of the current repository
 			$ gh browse
-			#=> Open the home page of the current repository
 
+			# Open the script directory of the current repository
+			$ gh browse script/
+
+			# Open issue or pull request 217
 			$ gh browse 217
-			#=> Open issue or pull request 217
 
+			# Open commit page
 			$ gh browse 77507cd94ccafcf568f8560cfecde965fcfa63
-			#=> Open commit page
 
+			# Open repository settings
 			$ gh browse --settings
-			#=> Open repository settings
 
+			# Open main.go at line 312
 			$ gh browse main.go:312
-			#=> Open main.go at line 312
 
-			$ gh browse main.go --branch main
-			#=> Open main.go in the main branch
+			# Open main.go with the repository at head of bug-fix branch
+			$ gh browse main.go --branch bug-fix
+
+			# Open main.go with the repository at commit 775007cd
+			$ gh browse main.go --commit=77507cd94ccafcf568f8560cfecde965fcfa63
 		`),
 		Annotations: map[string]string{
 			"help:arguments": heredoc.Doc(`
 				A browser location can be specified using arguments in the following format:
 				- by number for issue or pull request, e.g. "123"; or
-				- by path for opening folders and files, e.g. "cmd/gh/main.go"
+				- by path for opening folders and files, e.g. "cmd/gh/main.go"; or
+				- by commit SHA
 			`),
 			"help:environment": heredoc.Doc(`
 				To configure a web browser other than the default, use the BROWSER environment variable.
@@ -95,18 +116,35 @@ func NewCmdBrowse(f *cmdutil.Factory, runF func(*BrowseOptions) error) *cobra.Co
 			}
 
 			if err := cmdutil.MutuallyExclusive(
-				"specify only one of `--branch`, `--commit`, `--releases`, `--projects`, `--wiki`, or `--settings`",
-				opts.Branch != "",
-				opts.CommitFlag,
-				opts.WikiFlag,
-				opts.SettingsFlag,
+				"arguments not supported when using `--projects`, `--releases`, `--settings`, or `--wiki`",
+				opts.SelectorArg != "",
 				opts.ProjectsFlag,
 				opts.ReleasesFlag,
+				opts.SettingsFlag,
+				opts.WikiFlag,
 			); err != nil {
 				return err
 			}
-			if cmd.Flags().Changed("repo") {
+
+			if err := cmdutil.MutuallyExclusive(
+				"specify only one of `--branch`, `--commit`, `--projects`, `--releases`, `--settings`, or `--wiki`",
+				opts.Branch != "",
+				opts.Commit != "",
+				opts.ProjectsFlag,
+				opts.ReleasesFlag,
+				opts.SettingsFlag,
+				opts.WikiFlag,
+			); err != nil {
+				return err
+			}
+
+			if (isNumber(opts.SelectorArg) || isCommit(opts.SelectorArg)) && (opts.Branch != "" || opts.Commit != "") {
+				return cmdutil.FlagErrorf("%q is an invalid argument when using `--branch` or `--commit`", opts.SelectorArg)
+			}
+
+			if cmd.Flags().Changed("repo") || os.Getenv("GH_REPO") != "" {
 				opts.GitClient = &remoteGitClient{opts.BaseRepo, opts.HttpClient}
+				opts.HasRepoOverride = true
 			}
 
 			if runF != nil {
@@ -122,8 +160,13 @@ func NewCmdBrowse(f *cmdutil.Factory, runF func(*BrowseOptions) error) *cobra.Co
 	cmd.Flags().BoolVarP(&opts.WikiFlag, "wiki", "w", false, "Open repository wiki")
 	cmd.Flags().BoolVarP(&opts.SettingsFlag, "settings", "s", false, "Open repository settings")
 	cmd.Flags().BoolVarP(&opts.NoBrowserFlag, "no-browser", "n", false, "Print destination URL instead of opening the browser")
-	cmd.Flags().BoolVarP(&opts.CommitFlag, "commit", "c", false, "Open the last commit")
+	cmd.Flags().StringVarP(&opts.Commit, "commit", "c", "", "Select another commit by passing in the commit SHA, default is the last commit")
 	cmd.Flags().StringVarP(&opts.Branch, "branch", "b", "", "Select another branch by passing in the branch name")
+
+	_ = cmdutil.RegisterBranchCompletionFlags(f.GitClient, cmd, "branch")
+
+	// Preserve backwards compatibility for when commit flag used to be a boolean flag.
+	cmd.Flags().Lookup("commit").NoOptDefVal = emptyCommitFlag
 
 	return cmd
 }
@@ -134,12 +177,12 @@ func runBrowse(opts *BrowseOptions) error {
 		return fmt.Errorf("unable to determine base repository: %w", err)
 	}
 
-	if opts.CommitFlag {
+	if opts.Commit != "" && opts.Commit == emptyCommitFlag {
 		commit, err := opts.GitClient.LastCommit()
 		if err != nil {
 			return err
 		}
-		opts.Branch = commit.Sha
+		opts.Commit = commit.Sha
 	}
 
 	section, err := parseSection(baseRepo, opts)
@@ -149,7 +192,19 @@ func runBrowse(opts *BrowseOptions) error {
 	url := ghrepo.GenerateRepoURL(baseRepo, "%s", section)
 
 	if opts.NoBrowserFlag {
-		_, err := fmt.Fprintln(opts.IO.Out, url)
+		client, err := opts.HttpClient()
+		if err != nil {
+			return err
+		}
+
+		exist, err := api.RepoExists(api.NewClientFromHTTP(client), baseRepo)
+		if err != nil {
+			return err
+		}
+		if !exist {
+			return fmt.Errorf("%s doesn't exist", text.DisplayURL(url))
+		}
+		_, err = fmt.Fprintln(opts.IO.Out, url)
 		return err
 	}
 
@@ -160,44 +215,48 @@ func runBrowse(opts *BrowseOptions) error {
 }
 
 func parseSection(baseRepo ghrepo.Interface, opts *BrowseOptions) (string, error) {
-	if opts.SelectorArg == "" {
-		if opts.ProjectsFlag {
-			return "projects", nil
-		} else if opts.ReleasesFlag {
-			return "releases", nil
-		} else if opts.SettingsFlag {
-			return "settings", nil
-		} else if opts.WikiFlag {
-			return "wiki", nil
-		} else if opts.Branch == "" {
+	if opts.ProjectsFlag {
+		return "projects", nil
+	} else if opts.ReleasesFlag {
+		return "releases", nil
+	} else if opts.SettingsFlag {
+		return "settings", nil
+	} else if opts.WikiFlag {
+		return "wiki", nil
+	}
+
+	ref := opts.Branch
+	if opts.Commit != "" {
+		ref = opts.Commit
+	}
+
+	if ref == "" {
+		if opts.SelectorArg == "" {
 			return "", nil
+		}
+		if isNumber(opts.SelectorArg) {
+			return fmt.Sprintf("issues/%s", strings.TrimPrefix(opts.SelectorArg, "#")), nil
+		}
+		if isCommit(opts.SelectorArg) {
+			return fmt.Sprintf("commit/%s", opts.SelectorArg), nil
 		}
 	}
 
-	if isNumber(opts.SelectorArg) {
-		return fmt.Sprintf("issues/%s", strings.TrimPrefix(opts.SelectorArg, "#")), nil
-	}
-
-	if isCommit(opts.SelectorArg) {
-		return fmt.Sprintf("commit/%s", opts.SelectorArg), nil
-	}
-
-	filePath, rangeStart, rangeEnd, err := parseFile(*opts, opts.SelectorArg)
-	if err != nil {
-		return "", err
-	}
-
-	branchName := opts.Branch
-	if branchName == "" {
+	if ref == "" {
 		httpClient, err := opts.HttpClient()
 		if err != nil {
 			return "", err
 		}
 		apiClient := api.NewClientFromHTTP(httpClient)
-		branchName, err = api.RepoDefaultBranch(apiClient, baseRepo)
+		ref, err = api.RepoDefaultBranch(apiClient, baseRepo)
 		if err != nil {
 			return "", fmt.Errorf("error determining the default branch: %w", err)
 		}
+	}
+
+	filePath, rangeStart, rangeEnd, err := parseFile(*opts, opts.SelectorArg)
+	if err != nil {
+		return "", err
 	}
 
 	if rangeStart > 0 {
@@ -207,9 +266,10 @@ func parseSection(baseRepo ghrepo.Interface, opts *BrowseOptions) (string, error
 		} else {
 			rangeFragment = fmt.Sprintf("L%d", rangeStart)
 		}
-		return fmt.Sprintf("blob/%s/%s?plain=1#%s", escapePath(branchName), escapePath(filePath), rangeFragment), nil
+		return fmt.Sprintf("blob/%s/%s?plain=1#%s", escapePath(ref), escapePath(filePath), rangeFragment), nil
 	}
-	return strings.TrimSuffix(fmt.Sprintf("tree/%s/%s", escapePath(branchName), escapePath(filePath)), "/"), nil
+
+	return strings.TrimSuffix(fmt.Sprintf("tree/%s/%s", escapePath(ref), escapePath(filePath)), "/"), nil
 }
 
 // escapePath URL-encodes special characters but leaves slashes unchanged
@@ -229,7 +289,7 @@ func parseFile(opts BrowseOptions, f string) (p string, start int, end int, err 
 	}
 
 	p = filepath.ToSlash(parts[0])
-	if !path.IsAbs(p) {
+	if !path.IsAbs(p) && !opts.HasRepoOverride {
 		p = path.Join(opts.PathFromRepoRoot(), p)
 		if p == "." || strings.HasPrefix(p, "..") {
 			p = ""

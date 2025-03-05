@@ -13,7 +13,7 @@ import (
 	"github.com/MakeNowJust/heredoc"
 	"github.com/charmbracelet/glamour"
 	"github.com/cli/cli/v2/git"
-	"github.com/cli/cli/v2/internal/config"
+	"github.com/cli/cli/v2/internal/gh"
 	"github.com/cli/cli/v2/internal/ghrepo"
 	"github.com/cli/cli/v2/pkg/extensions"
 	"github.com/cli/cli/v2/pkg/iostreams"
@@ -33,7 +33,7 @@ type ExtBrowseOpts struct {
 	Em           extensions.ExtensionManager
 	Client       *http.Client
 	Logger       *log.Logger
-	Cfg          config.Config
+	Cfg          gh.Config
 	Rg           *readmeGetter
 	Debug        bool
 	SingleColumn bool
@@ -343,7 +343,7 @@ func getExtensions(opts ExtBrowseOpts) ([]extEntry, error) {
 		return extEntries, fmt.Errorf("failed to search for extensions: %w", err)
 	}
 
-	host, _ := opts.Cfg.DefaultHost()
+	host, _ := opts.Cfg.Authentication().DefaultHost()
 
 	for _, repo := range result.Items {
 		if !strings.HasPrefix(repo.Name, "gh-") {

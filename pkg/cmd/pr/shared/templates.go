@@ -2,6 +2,7 @@ package shared
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -15,8 +16,9 @@ import (
 )
 
 type issueTemplate struct {
-	Gname string `graphql:"name"`
-	Gbody string `graphql:"body"`
+	Gname  string `graphql:"name"`
+	Gbody  string `graphql:"body"`
+	Gtitle string `graphql:"title"`
 }
 
 type pullRequestTemplate struct {
@@ -36,6 +38,10 @@ func (t *issueTemplate) Body() []byte {
 	return []byte(t.Gbody)
 }
 
+func (t *issueTemplate) Title() string {
+	return t.Gtitle
+}
+
 func (t *pullRequestTemplate) Name() string {
 	return t.Gname
 }
@@ -46,6 +52,10 @@ func (t *pullRequestTemplate) NameForSubmit() string {
 
 func (t *pullRequestTemplate) Body() []byte {
 	return []byte(t.Gbody)
+}
+
+func (t *pullRequestTemplate) Title() string {
+	return ""
 }
 
 func listIssueTemplates(httpClient *http.Client, repo ghrepo.Interface) ([]Template, error) {
@@ -108,6 +118,7 @@ type Template interface {
 	Name() string
 	NameForSubmit() string
 	Body() []byte
+	Title() string
 }
 
 type iprompter interface {
@@ -199,6 +210,24 @@ func (m *templateManager) Choose() (Template, error) {
 	return m.templates[selectedOption], nil
 }
 
+func (m *templateManager) Select(name string) (Template, error) {
+	if err := m.memoizedFetch(); err != nil {
+		return nil, err
+	}
+
+	if len(m.templates) == 0 {
+		return nil, errors.New("no templates found")
+	}
+
+	for _, t := range m.templates {
+		if t.Name() == name {
+			return t, nil
+		}
+	}
+
+	return nil, fmt.Errorf("template %q not found", name)
+}
+
 func (m *templateManager) memoizedFetch() error {
 	if m.didFetch {
 		return m.fetchError
@@ -274,4 +303,8 @@ func (t *filesystemTemplate) NameForSubmit() string {
 
 func (t *filesystemTemplate) Body() []byte {
 	return githubtemplate.ExtractContents(t.path)
+}
+
+func (t *filesystemTemplate) Title() string {
+	return githubtemplate.ExtractTitle(t.path)
 }

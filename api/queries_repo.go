@@ -16,7 +16,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/cli/cli/v2/internal/ghrepo"
-	ghAPI "github.com/cli/go-gh/pkg/api"
+	ghAPI "github.com/cli/go-gh/v2/pkg/api"
 	"github.com/shurcooL/githubv4"
 )
 
@@ -41,9 +41,10 @@ type Repository struct {
 	MirrorURL                string
 	SecurityPolicyURL        string
 
-	CreatedAt time.Time
-	PushedAt  *time.Time
-	UpdatedAt time.Time
+	CreatedAt  time.Time
+	PushedAt   *time.Time
+	UpdatedAt  time.Time
+	ArchivedAt *time.Time
 
 	IsBlankIssuesEnabled    bool
 	IsSecurityPolicyEnabled bool
@@ -123,6 +124,9 @@ type Repository struct {
 	}
 	Projects struct {
 		Nodes []RepoProject
+	}
+	ProjectsV2 struct {
+		Nodes []ProjectV2
 	}
 
 	// pseudo-field that keeps track of host name of this repo
@@ -204,8 +208,24 @@ type IssueLabel struct {
 }
 
 type License struct {
-	Key  string `json:"key"`
-	Name string `json:"name"`
+	Key            string   `json:"key"`
+	Name           string   `json:"name"`
+	SPDXID         string   `json:"spdx_id"`
+	URL            string   `json:"url"`
+	NodeID         string   `json:"node_id"`
+	HTMLURL        string   `json:"html_url"`
+	Description    string   `json:"description"`
+	Implementation string   `json:"implementation"`
+	Permissions    []string `json:"permissions"`
+	Conditions     []string `json:"conditions"`
+	Limitations    []string `json:"limitations"`
+	Body           string   `json:"body"`
+	Featured       bool     `json:"featured"`
+}
+
+type GitIgnore struct {
+	Name   string `json:"name"`
+	Source string `json:"source"`
 }
 
 // RepoOwner is the login name of the owner
@@ -263,8 +283,8 @@ func FetchRepository(client *Client, repo ghrepo.Interface, fields []string) (*R
 	// guaranteed to happen when an authentication token with insufficient permissions is being used.
 	if result.Repository == nil {
 		return nil, GraphQLError{
-			GQLError: ghAPI.GQLError{
-				Errors: []ghAPI.GQLErrorItem{{
+			GraphQLError: &ghAPI.GraphQLError{
+				Errors: []ghAPI.GraphQLErrorItem{{
 					Type:    "NOT_FOUND",
 					Message: fmt.Sprintf("Could not resolve to a Repository with the name '%s/%s'.", repo.RepoOwner(), repo.RepoName()),
 				}},
@@ -316,8 +336,8 @@ func GitHubRepo(client *Client, repo ghrepo.Interface) (*Repository, error) {
 	// guaranteed to happen when an authentication token with insufficient permissions is being used.
 	if result.Repository == nil {
 		return nil, GraphQLError{
-			GQLError: ghAPI.GQLError{
-				Errors: []ghAPI.GQLErrorItem{{
+			GraphQLError: &ghAPI.GraphQLError{
+				Errors: []ghAPI.GraphQLErrorItem{{
 					Type:    "NOT_FOUND",
 					Message: fmt.Sprintf("Could not resolve to a Repository with the name '%s/%s'.", repo.RepoOwner(), repo.RepoName()),
 				}},
@@ -548,7 +568,7 @@ func ForkRepo(client *Client, repo ghrepo.Interface, org, newName string, defaul
 	// The GitHub API will happily return a HTTP 200 when attempting to fork own repo even though no forking
 	// actually took place. Ensure that we raise an error instead.
 	if ghrepo.IsSame(repo, newRepo) {
-		return newRepo, fmt.Errorf("%s cannot be forked", ghrepo.FullName(repo))
+		return newRepo, fmt.Errorf("%s cannot be forked. A single user account cannot own both a parent and fork.", ghrepo.FullName(repo))
 	}
 
 	return newRepo, nil
@@ -1333,4 +1353,108 @@ func CreateRepoTransformToV4(apiClient *Client, hostname string, method string, 
 		URL:       responsev3.HTMLUrl,
 		IsPrivate: responsev3.Private,
 	}, nil
+}
+
+// MapReposToIDs retrieves a set of IDs for the given set of repositories.
+// This is similar logic to RepoNetwork, but only fetches databaseId and does not
+// discover parent repositories.
+func GetRepoIDs(client *Client, host string, repositories []ghrepo.Interface) ([]int64, error) {
+	queries := make([]string, 0, len(repositories))
+	for i, repo := range repositories {
+		queries = append(queries, fmt.Sprintf(`
+			repo_%03d: repository(owner: %q, name: %q) {
+				databaseId
+			}
+		`, i, repo.RepoOwner(), repo.RepoName()))
+	}
+
+	query := fmt.Sprintf(`query MapRepositoryNames { %s }`, strings.Join(queries, ""))
+
+	graphqlResult := make(map[string]*struct {
+		DatabaseID int64 `json:"databaseId"`
+	})
+
+	if err := client.GraphQL(host, query, nil, &graphqlResult); err != nil {
+		return nil, fmt.Errorf("failed to look up repositories: %w", err)
+	}
+
+	repoKeys := make([]string, 0, len(repositories))
+	for k := range graphqlResult {
+		repoKeys = append(repoKeys, k)
+	}
+	sort.Strings(repoKeys)
+
+	result := make([]int64, len(repositories))
+	for i, k := range repoKeys {
+		result[i] = graphqlResult[k].DatabaseID
+	}
+	return result, nil
+}
+
+func RepoExists(client *Client, repo ghrepo.Interface) (bool, error) {
+	path := fmt.Sprintf("%srepos/%s/%s", ghinstance.RESTPrefix(repo.RepoHost()), repo.RepoOwner(), repo.RepoName())
+
+	resp, err := client.HTTP().Head(path)
+	if err != nil {
+		return false, err
+	}
+
+	switch resp.StatusCode {
+	case 200:
+		return true, nil
+	case 404:
+		return false, nil
+	default:
+		return false, ghAPI.HandleHTTPError(resp)
+	}
+}
+
+// RepoLicenses fetches available repository licenses.
+// It uses API v3 because licenses are not supported by GraphQL.
+func RepoLicenses(httpClient *http.Client, hostname string) ([]License, error) {
+	var licenses []License
+	client := NewClientFromHTTP(httpClient)
+	err := client.REST(hostname, "GET", "licenses", nil, &licenses)
+	if err != nil {
+		return nil, err
+	}
+	return licenses, nil
+}
+
+// RepoLicense fetches an available repository license.
+// It uses API v3 because licenses are not supported by GraphQL.
+func RepoLicense(httpClient *http.Client, hostname string, licenseName string) (*License, error) {
+	var license License
+	client := NewClientFromHTTP(httpClient)
+	path := fmt.Sprintf("licenses/%s", licenseName)
+	err := client.REST(hostname, "GET", path, nil, &license)
+	if err != nil {
+		return nil, err
+	}
+	return &license, nil
+}
+
+// RepoGitIgnoreTemplates fetches available repository gitignore templates.
+// It uses API v3 here because gitignore template isn't supported by GraphQL.
+func RepoGitIgnoreTemplates(httpClient *http.Client, hostname string) ([]string, error) {
+	var gitIgnoreTemplates []string
+	client := NewClientFromHTTP(httpClient)
+	err := client.REST(hostname, "GET", "gitignore/templates", nil, &gitIgnoreTemplates)
+	if err != nil {
+		return nil, err
+	}
+	return gitIgnoreTemplates, nil
+}
+
+// RepoGitIgnoreTemplate fetches an available repository gitignore template.
+// It uses API v3 here because gitignore template isn't supported by GraphQL.
+func RepoGitIgnoreTemplate(httpClient *http.Client, hostname string, gitIgnoreTemplateName string) (*GitIgnore, error) {
+	var gitIgnoreTemplate GitIgnore
+	client := NewClientFromHTTP(httpClient)
+	path := fmt.Sprintf("gitignore/templates/%s", gitIgnoreTemplateName)
+	err := client.REST(hostname, "GET", path, nil, &gitIgnoreTemplate)
+	if err != nil {
+		return nil, err
+	}
+	return &gitIgnoreTemplate, nil
 }
